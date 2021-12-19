@@ -83,7 +83,6 @@ RUN conda config --set pip_interop_enabled True
 # Preserving pip cache by omitting `--no-cache-dir`.
 RUN --mount=type=cache,target=${PIP_DOWNLOAD_CACHE} \
     python -m pip install \
-        hydra-core==1.1.0 \
-        hydra_colorlog==1.1.0
+        jax==0.2.26
 
 CMD ["/bin/bash"]
