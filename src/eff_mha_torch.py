@@ -2,6 +2,8 @@
 Native PyTorch implementation of efficient self-attention.
 This is not a copy of the JAX version but a
 PyTorch implementation based on first-principles.
+
+Warning: This version produces incorrect results.
 """
 import math
 
@@ -59,24 +61,13 @@ class EfficientMHA(nn.Module):
             out_features=embed_dim,
             bias=False
         )
+        self._reset_parameters()
 
     def _reset_parameters(self):
-        xavier_uniform_(self.q_proj_weight)
-        xavier_uniform_(self.k_proj_weight)
-        xavier_uniform_(self.v_proj_weight)
-
-    @staticmethod
-    def summarize_chunk(qc: Tensor, kc: Tensor, vc: Tensor):
-        # Keep all dimensions to allow accurate broadcasting and reduce confusion.
-        att = qc @ kc.movedim(-2, -1)
-        max_score, _ = torch.max(att, dim=-1, keepdim=True)
-        max_score = max_score.detach()  # Max score should not backprop.
-        # Subtract chunk row-wise maximum for numerical stability.
-        exp_att = torch.exp(att - max_score)
-        numerator = exp_att @ vc  # Numerator for softmax.
-        # Sum along rows for softmax denominator.
-        denominator = exp_att.sum(dim=-1)
-        return numerator, denominator, max_score.squeeze(-1)
+        xavier_uniform_(self.q_proj.weight)
+        xavier_uniform_(self.k_proj.weight)
+        xavier_uniform_(self.v_proj.weight)
+        xavier_uniform_(self.o_proj.weight)
 
     def forward(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
         n_q, l_q, e_q = query.shape
@@ -102,7 +93,6 @@ class EfficientMHA(nn.Module):
         # N, (S|L), E -> N, (S|L), H, D -> N, H, (S|L), D.
         # N: Batch size, S: Source length, L: Target length, E: Embedding dims,
         # H: Number of attention heads, D: Feature dims, where D = E // H.
-        # Normalize `q` by $\sqrt(d)$ and also make it memory contiguous.
         q = q.view(n_q, l_q, n_h, h_d).movedim(-3, -2) * (h_d ** -0.5)
         k = k.view(n_k, s_k, n_h, h_d).movedim(-3, -2)
         v = v.view(n_v, s_v, n_h, h_d).movedim(-3, -2)
@@ -114,41 +104,47 @@ class EfficientMHA(nn.Module):
         ks = k.tensor_split(math.ceil(s_k / c_s), dim=-2)
         vs = v.tensor_split(math.ceil(s_v / c_s), dim=-2)
 
-        result : Tensor = 0
+        result = list()
         for qc in qs:  # Chunked matrix multiplication.
-            res_buff = list()
-            for vc in vs:
-                # Buffers for the row of the (virtual) self-attention matrix.
-                num_buff: Tensor = 0
-                den_buff: Tensor = 0
-                max_buff: Tensor = None
-                for kc in ks:
-                    # Gradient checkpointing for memory-efficient backprop.
-                    numerator, denominator, max_score = \
-                        checkpoint(self.summarize_chunk, qc, kc, vc)
-                    num_buff += numerator
-                    den_buff += denominator
-                    if max_buff is None:
-                        max_buff = max_score
-                    else:
-                        max_buff = torch.maximum(max_buff, max_score)
-                    # num_buff.append(numerator)
-                    # den_buff.append(denominator)
-                    # max_buff.append(max_score)
-                # num_buff = torch.cat(num_buff, dim=-1)
-                # den_buff = torch.cat(den_buff, dim=-1)
-                # max_buff = torch.cat(max_buff, dim=-1)
-                row_max, _ = torch.max(max_buff, dim=-1, keepdim=True)
+            num_buff = list()
+            den_buff = list()
+            max_buff = list()
+            for kc, vc in zip(ks, vs):  # Summation on one chunked row of the output.
+                # Gradient checkpointing for memory-efficient backprop.
+                numerator, denominator, max_score = \
+                    checkpoint(self.summarize_chunk, qc, kc, vc)
+                num_buff.append(numerator)
+                den_buff.append(denominator)
+                max_buff.append(max_score)
+            # The maximum value of the self-attention rows are now available.
+            num_buff = torch.stack(num_buff, dim=-1)
+            den_buff = torch.stack(den_buff, dim=-1).unsqueeze(-2)
+            max_buff = torch.stack(max_buff, dim=-1).unsqueeze(-2)
+            row_max, _ = torch.max(max_buff, dim=-1, keepdim=True)
+            max_diffs = torch.exp(max_buff - row_max)
+            # Scalar multiplication along the row axis is exchangeable.
+            num_buff = torch.sum(num_buff * max_diffs, dim=-1)
+            den_buff = torch.sum(den_buff * max_diffs, dim=-1)
+            den_buff = den_buff.sum(dim=-1, keepdim=True)
+            assert num_buff.shape == (n_q, n_h, c_s, h_d), num_buff.shape
+            # C_L: Chunk length of target sequence.
+            result.append(num_buff / den_buff)  # N, H, C_L, D
+        result = torch.cat(result, dim=-2)  # N, H, L, D
+        assert result.shape == (n_q, n_h, l_q, h_d), f'{result.shape}.'
 
-                # The maximum value of the self-attention rows are now available.
-                max_diffs = torch.exp(max_buff - row_max)
-                num_buff *= max_diffs.unsqueeze(-1)
-                den_buff *= max_diffs
-                den_buff = torch.sum(den_buff, dim=-1, keepdim=True)
-                res_buff.append(num_buff / den_buff)  # Softmax properly applied.
-            res_buff = torch.cat(res_buff, dim=-1)
-            assert res_buff.shape == (n_q, n_h, l_q, h_d), f'{res_buff.shape}.'
-            result += res_buff
         # Return to N, L, E shape for the output.
         result = result.movedim(-2, -3).reshape(n_q, l_q, e_v).contiguous()
-        return self.o_proj(result)  # Output projection.
+        result = self.o_proj(result)  # Output projection.
+        return result
+
+    @staticmethod
+    def summarize_chunk(qc: Tensor, kc: Tensor, vc: Tensor):
+        att = qc @ kc.movedim(-2, -1)
+        max_score, _ = torch.max(att, dim=-1, keepdim=True)
+        max_score = max_score.detach()  # Max score should not backprop.
+        # Subtract chunk row-wise maximum for numerical stability.
+        exp_att = torch.exp(att - max_score)  # N, H, C_L, C_S.
+        numerator = exp_att @ vc  # Numerator for softmax. N, H, C_L, D.
+        # Sum along rows for softmax denominator.
+        denominator = exp_att.sum(dim=-1)  # N, H, C_L.
+        return numerator, denominator, max_score.squeeze(-1)
