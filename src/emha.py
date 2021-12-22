@@ -95,13 +95,28 @@ class ChunkedMHA(nn.Module):
         kcs = torch.tensor_split(key, math.ceil(s_k / c_s), dim=1)
         vcs = torch.tensor_split(value, math.ceil(s_v / c_s), dim=1)
 
-        result = list()  # I would prefer getting rid of this art, which is O(N).
-        for qc in qcs:
+        if isinstance(output, Tensor):
+            assert output.shape == (n_q, l_q, e_v)
+            ocs = torch.tensor_split(output, math.ceil(l_q / c_s), dim=1)
+        else:
+            ocs = None
+
+        result = list()
+
+        for i, qc in enumerate(qcs):
             buffer: Tensor = 0
             for kc, vc in zip(kcs, vcs):  # Gradient checkpointing.
                 buffer += checkpoint(self._att, qc, kc, vc)
-            result.append(buffer)
-        output = torch.cat(result, dim=-2, out=output)
+
+            if ocs is not None:
+                # This will replace values while passing the gradients, I hope.
+                # Whether gradients are passed properly needs confirmation.
+                ocs[i].put_(torch.arange(ocs[i].numel()), buffer)
+            else:
+                result.append(buffer)
+
+        if ocs is None:
+            output = torch.cat(result, dim=-2, out=output)
         return output
 
 
